@@ -1,0 +1,114 @@
+// =============================================
+// 1) Load station layer (must have "name" field)
+// =============================================
+var rawStations = ee.FeatureCollection("projects/ee-glagudo/assets/Vanuatu_VMGDStations_Final01");
+
+// Force every station to be a true point
+var stations = rawStations.map(function(f) {
+  return ee.Feature(f.geometry().centroid(1), f.toDictionary());
+});
+
+// =============================================
+// 2) Set temporal range
+// =============================================
+var startDate = ee.Date('1970-01-01');
+var endDate   = ee.Date('2000-12-30');
+
+// =============================================
+// 3) Load ERA5 Hourly and aggregate to DAILY
+// =============================================
+var numberOfDays = endDate.difference(startDate, 'days');
+
+var dailyImagesList = ee.List.sequence(0, numberOfDays.subtract(1)).map(function(dayOffset) {
+  var start = startDate.advance(dayOffset, 'days');
+  var end = start.advance(1, 'days');
+  
+  var dailySum = ee.ImageCollection('ECMWF/ERA5/HOURLY')
+                   .filterDate(start, end)
+                   .select('total_precipitation')
+                   .sum(); 
+                   
+  return dailySum.set({
+    'system:time_start': start.millis(),
+    'date_string': start.format('YYYY-MM-dd')
+  });
+});
+
+var era5Daily = ee.ImageCollection(dailyImagesList);
+
+// =============================================
+// 4) Extract daily rainfall per station
+// =============================================
+var extractDailyRain = function(image) {
+  var date = image.get('date_string');
+
+  var sampled = image.reduceRegions({
+    collection: stations,
+    reducer: ee.Reducer.first(),
+    scale: 27830                      
+  });
+
+  return sampled.map(function(f) {
+    var rainMeters = ee.Number(f.get("first"));
+    var rainMm = ee.Algorithms.If(rainMeters, rainMeters.multiply(1000), 0);
+
+    return f.set({
+      "date": date,
+      "precipitation_mm": rainMm
+    })
+    .select(["name", "date", "precipitation_mm"]);
+  });
+};
+
+// =============================================
+// 5) Apply to all days
+// =============================================
+var stationDailyRain = era5Daily.map(extractDailyRain).flatten();
+
+// =============================================
+// 6) DEBUG: show first 20 rows
+// =============================================
+//print(
+//  "Preview — Station / Date / Precipitation (mm)",
+//  stationDailyRain.limit(20)
+//);
+
+// =============================================
+// 7) Export to CSV
+// =============================================
+Export.table.toDrive({
+  collection: stationDailyRain,
+  description: "ERA5_Daily_Stations_Vanuatu",
+  fileFormat: "CSV"
+});
+
+// =============================================
+// 8) VISUALIZATION SECTION (CLIPPED)
+// =============================================
+// 1. Create the overall cumulative map for the period (converted to mm)
+var totalPeriodRainfall = ee.ImageCollection('ECMWF/ERA5/HOURLY')
+                            .filterDate(startDate, endDate)
+                            .select('total_precipitation')
+                            .sum()
+                            .multiply(1000); 
+
+// 2. CRITICAL CHANGE: Clip the rainfall image using your geometry
+// (Assumes your boundary layer variable is called 'geometry')
+var clippedRainfall = totalPeriodRainfall.clip(geometry);
+
+// Define visualization parameters
+var rainVis = {
+  min: 10000, 
+  max: 70000, 
+  palette: ['#f7fbff', '#deebf7', '#9ecae1', '#4292c6', '#084594'] 
+};
+
+// Center the map view around Vanuatu
+Map.setCenter(167.5, -16.0, 6);
+
+// Add the clipped rainfall layer and the stations to the map
+Map.addLayer(clippedRainfall, rainVis, 'Vanuatu Cumulative Rainfall 1998-2019 (mm)');
+Map.addLayer(stations, {color: 'red'}, "VMGD Stations");
+
+// Optional: Add the boundary line itself so you can see the borders clearly
+Map.addLayer(geometry, {color: 'black', fillColor: '00000000'}, 'Vanuatu Boundary');
